@@ -163,7 +163,15 @@ def retrieve_evidence(question, resources, top_k=5):
         .sort_values("Rerank_Score", ascending=False)
         .head(top_k)
     )
+    print("\nQUERY:", question)
+    print("\nRERANKING SCORES:")
 
+    print(
+        final_results[
+        ["Article_ID", "Rerank_Score", "Chunk_Text"]
+         ].to_string(index=False)
+    )
+    
     evidence = []
 
     for rank, (index, row) in enumerate(
