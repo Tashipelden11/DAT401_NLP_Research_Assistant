@@ -1,6 +1,7 @@
 
 import os
 import pickle
+import re
 from pathlib import Path
 
 import numpy as np
@@ -12,6 +13,10 @@ from google import genai
 from google.genai import types
 
 
+# ============================================================
+# 1. PROJECT CONFIGURATION
+# ============================================================
+
 PROJECT_DIR = Path(__file__).resolve().parent
 RESULTS_DIR = PROJECT_DIR / "results"
 
@@ -22,11 +27,16 @@ st.set_page_config(
 )
 
 st.title("📚 Evidence-Grounded Research Assistant")
+
 st.caption(
     "Research assistance on Generative AI in higher education, "
     "using 154 peer-reviewed research articles."
 )
 
+
+# ============================================================
+# 2. LOAD RESEARCH RESOURCES
+# ============================================================
 
 @st.cache_resource
 def load_research_resources():
@@ -88,6 +98,10 @@ def load_research_resources():
     )
 
 
+# ============================================================
+# 3. HYBRID RETRIEVAL AND CROSS-ENCODER RERANKING
+# ============================================================
+
 def retrieve_evidence(question, resources, top_k=5):
 
     (
@@ -99,26 +113,39 @@ def retrieve_evidence(question, resources, top_k=5):
         cross_encoder
     ) = resources
 
-    # BM25 retrieval
+    # --------------------------------------------------------
+    # BM25 lexical retrieval
+    # --------------------------------------------------------
+
     tokens = question.lower().split()
+
     bm25_scores = bm25_index.get_scores(tokens)
 
     bm25_indices = np.argsort(
-        -bm25_scores, kind="stable"
+        -bm25_scores,
+        kind="stable"
     )[:20]
 
-    # Dense retrieval
+    # --------------------------------------------------------
+    # Dense semantic retrieval
+    # --------------------------------------------------------
+
     query_embedding = embedding_model.encode(
         question,
         convert_to_numpy=True
     )
 
-    _, dense_indices = dense_index.kneighbors(
+    dense_distances, dense_indices = dense_index.kneighbors(
         query_embedding.reshape(1, -1),
         n_neighbors=20
     )
 
     dense_indices = dense_indices[0]
+    dense_distances = dense_distances[0]
+
+    # --------------------------------------------------------
+    # Retrieval ranks
+    # --------------------------------------------------------
 
     dense_ranks = {
         index: rank
@@ -132,23 +159,38 @@ def retrieve_evidence(question, resources, top_k=5):
 
     candidates = set(dense_ranks) | set(bm25_ranks)
 
+    # --------------------------------------------------------
     # Reciprocal Rank Fusion
+    # --------------------------------------------------------
+
     hybrid_scores = {
         index:
-        (1 / (60 + dense_ranks[index]) if index in dense_ranks else 0)
+        (
+            1 / (60 + dense_ranks[index])
+            if index in dense_ranks else 0
+        )
         +
-        (1 / (60 + bm25_ranks[index]) if index in bm25_ranks else 0)
+        (
+            1 / (60 + bm25_ranks[index])
+            if index in bm25_ranks else 0
+        )
         for index in candidates
     }
 
     ranked_indices = sorted(
         candidates,
-        key=lambda index: (-hybrid_scores[index], index)
+        key=lambda index: (
+            -hybrid_scores[index],
+            index
+        )
     )[:20]
 
     hybrid_results = chunks.iloc[ranked_indices].copy()
 
+    # --------------------------------------------------------
     # Cross-Encoder reranking
+    # --------------------------------------------------------
+
     pairs = [
         (question, text)
         for text in hybrid_results["Chunk_Text"]
@@ -160,18 +202,17 @@ def retrieve_evidence(question, resources, top_k=5):
 
     final_results = (
         hybrid_results
-        .sort_values("Rerank_Score", ascending=False)
+        .sort_values(
+            "Rerank_Score",
+            ascending=False
+        )
         .head(top_k)
     )
-    print("\nQUERY:", question)
-    print("\nRERANKING SCORES:")
 
-    print(
-        final_results[
-        ["Article_ID", "Rerank_Score", "Chunk_Text"]
-         ].to_string(index=False)
-    )
-    
+    # --------------------------------------------------------
+    # Construct evidence records
+    # --------------------------------------------------------
+
     evidence = []
 
     for rank, (index, row) in enumerate(
@@ -189,17 +230,29 @@ def retrieve_evidence(question, resources, top_k=5):
             "Journal": metadata["Crossref_Journal"],
             "DOI": metadata["DOI"],
             "Page": row["Page"],
+            "Hybrid_Score": float(hybrid_scores[index]),
+            "Dense_Distance": float(
+                dense_distances[
+                    np.where(dense_indices == index)[0][0]
+                ]
+            ) if index in dense_ranks else None,
+            "Rerank_Score": float(row["Rerank_Score"]),
             "Passage": row["Chunk_Text"]
         })
 
     return evidence
 
 
+# ============================================================
+# 4. BUILD EVIDENCE CONTEXT
+# ============================================================
+
 def build_context(evidence):
 
     sections = []
 
     for item in evidence:
+
         sections.append(
             f"""
 [{item['Evidence_ID']}]
@@ -219,6 +272,10 @@ Supporting passage:
     return "\n\n".join(sections)
 
 
+# ============================================================
+# 5. GEMINI ANSWER GENERATION
+# ============================================================
+
 def generate_answer(question, context, client):
 
     prompt = f"""
@@ -228,6 +285,7 @@ in Generative AI in higher education.
 Answer using ONLY the supplied research evidence.
 
 STRICT RULES:
+
 1. Do not invent facts, statistics, findings or citations.
 2. Cite factual claims using [E01, p.8] format.
 3. Use only evidence IDs and page numbers supplied below.
@@ -236,6 +294,9 @@ STRICT RULES:
 5. Do not present perceptions as proof of improved academic performance.
 6. If evidence is insufficient, clearly state this.
 7. Provide a concise academic answer.
+8. If the research passages do not meaningfully address the
+   question, explicitly state that the available evidence
+   cannot answer it.
 
 RESEARCH QUESTION:
 {question}
@@ -256,17 +317,26 @@ EVIDENCE-GROUNDED ANSWER:
     )
 
     if not response.text or not response.text.strip():
-        raise ValueError("The language model returned an empty answer.")
+
+        raise ValueError(
+            "The language model returned an empty answer."
+        )
 
     return response.text.strip()
 
 
+# ============================================================
+# 6. CITATION VALIDATION
+# ============================================================
+
 def validate_citations(answer, evidence):
 
     citation_pattern = r"\[(E\d+),\s*p\.\s*(\d+)\]"
-    import re
 
-    citations = re.findall(citation_pattern, answer)
+    citations = re.findall(
+        citation_pattern,
+        answer
+    )
 
     lookup = {
         item["Evidence_ID"]: item
@@ -280,10 +350,15 @@ def validate_citations(answer, evidence):
         record = lookup.get(evidence_id)
 
         if record is None:
+
             status = "Invalid evidence ID"
+
         elif str(record["Page"]) != page:
+
             status = "Page mismatch"
+
         else:
+
             status = "Valid"
 
         results.append({
@@ -295,30 +370,43 @@ def validate_citations(answer, evidence):
     return results
 
 
-# Sidebar
+# ============================================================
+# 7. SIDEBAR AND API CONFIGURATION
+# ============================================================
+
 with st.sidebar:
+
     st.header("Research assistant")
+
     st.write("**Corpus:** 154 research articles")
     st.write("**Chunks:** 11,273")
     st.write("**Retrieval:** Hybrid RRF + Cross-Encoder")
     st.write("**Answer generation:** Gemini")
 
-    # Read the API key securely from Streamlit Cloud Secrets.
     try:
-        secret_api_key = st.secrets.get("GEMINI_API_KEY", "")
+
+        secret_api_key = st.secrets.get(
+            "GEMINI_API_KEY",
+            ""
+        )
+
     except Exception:
+
         secret_api_key = ""
 
     default_api_key = (
-        secret_api_key or os.environ.get("GEMINI_API_KEY", "")
+        secret_api_key
+        or os.environ.get("GEMINI_API_KEY", "")
     )
 
-    # Password input remains available for local testing.
     api_key = st.text_input(
         "Gemini API key",
         type="password",
         value=default_api_key,
-        help="The key is stored in Streamlit Secrets or entered for this session."
+        help=(
+            "The key is stored in Streamlit Secrets "
+            "or entered for this session."
+        )
     )
 
     st.caption(
@@ -327,17 +415,30 @@ with st.sidebar:
     )
 
 
-# Chat interface
+# ============================================================
+# 8. CHAT INTERFACE
+# ============================================================
+
 if "messages" not in st.session_state:
+
     st.session_state.messages = []
 
+
 for message in st.session_state.messages:
+
     with st.chat_message(message["role"]):
+
         st.markdown(message["content"])
+
 
 question = st.chat_input(
     "Ask a research question about Generative AI in higher education..."
 )
+
+
+# ============================================================
+# 9. PROCESS USER QUESTION
+# ============================================================
 
 if question:
 
@@ -347,76 +448,197 @@ if question:
     })
 
     with st.chat_message("user"):
+
         st.markdown(question)
 
     with st.chat_message("assistant"):
 
         if not api_key.strip():
-            st.warning("Enter your Gemini API key in the sidebar.")
+
+            st.warning(
+                "Enter your Gemini API key in the sidebar."
+            )
+
             st.stop()
 
         try:
-            with st.spinner("Loading research resources..."):
+
+            # ------------------------------------------------
+            # Load models and research resources
+            # ------------------------------------------------
+
+            with st.spinner(
+                "Loading research resources..."
+            ):
+
                 resources = load_research_resources()
 
-            client = genai.Client(api_key=api_key)
+            client = genai.Client(
+                api_key=api_key
+            )
 
-            with st.spinner("Searching research articles..."):
-                evidence = retrieve_evidence(question, resources)
+            # ------------------------------------------------
+            # Retrieve evidence
+            # ------------------------------------------------
+
+            with st.spinner(
+                "Searching research articles..."
+            ):
+
+                evidence = retrieve_evidence(
+                    question,
+                    resources
+                )
 
             if not evidence:
-                st.warning("No supporting passages were retrieved.")
+
+                st.warning(
+                    "No supporting passages were retrieved."
+                )
+
                 st.stop()
+
+            # ------------------------------------------------
+            # DIAGNOSTIC: RERANKING SCORES
+            # ------------------------------------------------
+
+            with st.expander(
+                "Diagnostic: Reranking Scores",
+                expanded=True
+            ):
+
+                diagnostic_df = pd.DataFrame([
+
+                    {
+                        "Evidence_ID": item["Evidence_ID"],
+                        "Article_ID": item["Article_ID"],
+                        "Hybrid_Score": item["Hybrid_Score"],
+                        "Dense_Distance": item["Dense_Distance"],
+                        "Rerank_Score": item["Rerank_Score"],
+                        "Passage": item["Passage"]
+                    }
+
+                    for item in evidence
+
+                ])
+
+                st.dataframe(
+                    diagnostic_df,
+                    width="stretch"
+                )
+
+                st.caption(
+                    "Diagnostic scores are used for retrieval "
+                    "analysis. They are not calibrated probabilities "
+                    "of relevance."
+                )
+
+            # ------------------------------------------------
+            # Build evidence context
+            # ------------------------------------------------
 
             context = build_context(evidence)
 
-            with st.spinner("Generating an evidence-grounded answer..."):
+            # ------------------------------------------------
+            # Generate answer
+            # ------------------------------------------------
+
+            with st.spinner(
+                "Generating an evidence-grounded answer..."
+            ):
+
                 answer = generate_answer(
-                    question, context, client
+                    question,
+                    context,
+                    client
                 )
 
             st.markdown(answer)
 
+            # ------------------------------------------------
+            # Validate citations
+            # ------------------------------------------------
+
             citation_results = validate_citations(
-                answer, evidence
+                answer,
+                evidence
             )
 
-            with st.expander("Retrieved research evidence"):
+            # ------------------------------------------------
+            # Retrieved research evidence
+            # ------------------------------------------------
+
+            with st.expander(
+                "Retrieved research evidence"
+            ):
+
                 for item in evidence:
+
                     st.markdown(
-                        f"**{item['Evidence_ID']} — {item['Title']}**"
+                        f"**{item['Evidence_ID']} — "
+                        f"{item['Title']}**"
                     )
+
                     st.caption(
                         f"{item['Authors']} ({item['Year']}) | "
-                        f"{item['Journal']} | Page {item['Page']}"
+                        f"{item['Journal']} | "
+                        f"Page {item['Page']}"
                     )
+
                     st.write(item["Passage"])
 
                     if pd.notna(item["DOI"]):
-                        st.write(f"DOI: {item['DOI']}")
+
+                        st.write(
+                            f"DOI: {item['DOI']}"
+                        )
 
                     st.divider()
 
-            with st.expander("Citation validation"):
+            # ------------------------------------------------
+            # Citation validation results
+            # ------------------------------------------------
+
+            with st.expander(
+                "Citation validation"
+            ):
+
                 if citation_results:
+
                     st.dataframe(
                         pd.DataFrame(citation_results),
-                        use_container_width=True
+                        width="stretch"
                     )
+
                 else:
-                    st.info("No formatted evidence citations were detected.")
+
+                    st.info(
+                        "No formatted evidence citations were detected."
+                    )
 
             invalid = [
-                item for item in citation_results
+
+                item
+                for item in citation_results
                 if item["Status"] != "Valid"
+
             ]
 
             if invalid:
+
                 st.warning(
                     "Some citations did not match the retrieved evidence."
                 )
+
             elif citation_results:
-                st.success("All detected citations match the retrieved evidence.")
+
+                st.success(
+                    "All detected citations match the retrieved evidence."
+                )
+
+            # ------------------------------------------------
+            # Save assistant response to chat history
+            # ------------------------------------------------
 
             st.session_state.messages.append({
                 "role": "assistant",
@@ -424,11 +646,20 @@ if question:
             })
 
         except Exception as error:
-            st.error(f"An error occurred: {error}")
+
+            st.error(
+                f"An error occurred: {error}"
+            )
+
             st.exception(error)
 
 
+# ============================================================
+# 10. FOOTER
+# ============================================================
+
 st.divider()
+
 st.caption(
     "DAT401 Natural Language Processing Group Project | "
     "Evidence-Grounded Research Assistant"
