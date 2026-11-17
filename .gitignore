@@ -1,0 +1,38 @@
+﻿# Secrets and credentials
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+secrets.toml
+*.pem
+*.key
+
+# Python temporary files
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local model caches
+.cache/
+huggingface/
+models/
+
+# Original research PDFs
+pdfs/
+PDFs/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Research notebooks and PDF documents
+*.ipynb
+*.pdf
+*.PDF
